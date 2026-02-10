@@ -1,0 +1,19 @@
+# Data files (sensitif, jangan push)
+*.zip
+*.xlsx
+*.xls
+*.csv
+
+# Output folders
+output_merged/
+dashboard_output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
