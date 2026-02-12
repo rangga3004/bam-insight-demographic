@@ -114,7 +114,7 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
                         if ef.lower().endswith('.csv'):
                             df_part = pd.read_csv(file_bytes)
                         else:
-                            df_part = pd.read_excel(file_bytes, engine='openpyxl')
+                            df_part = pd.read_excel(file_bytes, engine='openpyxl', dtype=str)
                         all_dfs.append(df_part)
                     except Exception:
                         st.warning(f"Gagal membaca: {base}")
@@ -123,7 +123,7 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
 
         elif mode == 'excel':
             status_text.text(f"📖 Membaca: {uf.name}  ({done + 1}/{total})")
-            df_part = pd.read_excel(BytesIO(uf.read()), engine='openpyxl')
+            df_part = pd.read_excel(BytesIO(uf.read()), engine='openpyxl', dtype=str)
             all_dfs.append(df_part)
             done += 1
             progress_bar.progress(done / total, text=f"{int(done / total * 100)}%")
