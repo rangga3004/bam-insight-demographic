@@ -6,10 +6,8 @@ Streamlit Local App
 import os
 import zipfile
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 from io import BytesIO
-from datetime import datetime
 
 # --- Page Config ---
 import streamlit as st
@@ -34,7 +32,9 @@ COL_STATUS   = 'Status Pesanan'
 COL_HARGA    = 'Total Harga Produk'
 COL_PROVINSI = 'Provinsi'
 COL_TANGGAL  = 'Waktu Pesanan Dibuat'
-COLS_NEEDED  = [COL_STATUS, COL_HARGA, COL_PROVINSI, COL_TANGGAL]
+COL_HARGA_DISKON = 'Harga Setelah Diskon'
+COL_JUMLAH = 'Jumlah'
+COLS_NEEDED  = [COL_STATUS, COL_PROVINSI]
 
 BULAN_INDO = {
     1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'Mei', 6: 'Jun',
@@ -70,24 +70,123 @@ def format_rupiah_singkat(angka):
         return f"Rp {format_rupiah(angka)}"
 
 
+def parse_angka_indonesia(series):
+    """Parse Indonesian-formatted numeric strings into floats."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors='coerce').fillna(0)
+
+    return pd.to_numeric(
+        series
+        .astype(str)
+        .str.replace('.', '', regex=False)
+        .str.replace(',', '.', regex=False),
+        errors='coerce'
+    ).fillna(0)
+
+
+def get_chart_footer(exclude_batal):
+    status_label = 'Status ≠ Batal' if exclude_batal else 'Status: Semua Pesanan'
+    return f'Data source: Shopee Order Export  ·  {status_label}'
+
+
+def validate_required_columns(df):
+    """Validate whether a dataframe has the minimum columns needed for analysis."""
+    missing_cols = [col for col in COLS_NEEDED if col not in df.columns]
+    has_total_harga = COL_HARGA in df.columns
+    has_fallback_harga = COL_HARGA_DISKON in df.columns and COL_JUMLAH in df.columns
+
+    if has_total_harga or has_fallback_harga:
+        harga_message = None
+    else:
+        harga_message = (
+            f"{COL_HARGA} atau kombinasi {COL_HARGA_DISKON} + {COL_JUMLAH}"
+        )
+
+    if not missing_cols and harga_message is None:
+        return None
+
+    missing_parts = missing_cols.copy()
+    if harga_message is not None:
+        missing_parts.append(harga_message)
+    return missing_parts
+
+
+def ensure_total_harga_produk(df):
+    """Ensure total price column exists, with fallback to discounted price x quantity."""
+    if COL_HARGA in df.columns:
+        return df
+
+    if COL_HARGA_DISKON in df.columns and COL_JUMLAH in df.columns:
+        df = df.copy()
+        harga_setelah_diskon = parse_angka_indonesia(df[COL_HARGA_DISKON])
+        jumlah_produk = parse_angka_indonesia(df[COL_JUMLAH])
+        df[COL_HARGA] = harga_setelah_diskon * jumlah_produk
+        return df
+
+    missing_cols = []
+    if COL_HARGA_DISKON not in df.columns:
+        missing_cols.append(COL_HARGA_DISKON)
+    if COL_JUMLAH not in df.columns:
+        missing_cols.append(COL_JUMLAH)
+    raise KeyError(
+        f"Kolom '{COL_HARGA}' tidak ditemukan, dan fallback membutuhkan kolom: {', '.join(missing_cols)}"
+    )
+
+
+def get_supported_zip_members(zip_file):
+    return [
+        name for name in zip_file.namelist()
+        if (
+            name.lower().endswith('.xlsx')
+            or name.lower().endswith('.xls')
+            or name.lower().endswith('.csv')
+        )
+        and not name.startswith('__MACOSX')
+        and not os.path.basename(name).startswith('~$')
+    ]
+
+
+def advance_progress(progress_bar, done, total):
+    progress = done / total if total else 1
+    progress_bar.progress(progress, text=f"{int(progress * 100)}%")
+
+
+def load_dataframe_from_bytes(file_name, raw_bytes):
+    file_bytes = BytesIO(raw_bytes)
+    if file_name.lower().endswith('.csv'):
+        return pd.read_csv(file_bytes)
+    return pd.read_excel(file_bytes, engine='openpyxl', dtype=str)
+
+
+def validate_and_prepare_dataframe(df, source_name):
+    missing_parts = validate_required_columns(df)
+    if missing_parts:
+        missing_text = '; '.join(missing_parts)
+        return None, f"Skip `{source_name}`: kolom wajib tidak lengkap ({missing_text})."
+
+    try:
+        prepared_df = ensure_total_harga_produk(df)
+    except KeyError as exc:
+        return None, f"Skip `{source_name}`: {exc.args[0]}."
+
+    return prepared_df, None
+
+
 def count_total_files(uploaded_files, mode):
     """Count total files to process (for progress bar)."""
     total = 0
     if mode == 'zip':
         for uf in uploaded_files:
             raw = uf.read()
-            uf.seek(0)  # Reset for later read
-            with zipfile.ZipFile(BytesIO(raw), 'r') as z:
-                excel_files = [
-                    f for f in z.namelist()
-                    if (f.lower().endswith('.xlsx') or f.lower().endswith('.xls') or f.lower().endswith('.csv'))
-                    and not f.startswith('__MACOSX')
-                    and not os.path.basename(f).startswith('~$')
-                ]
-                total += len(excel_files)
+            uf.seek(0)
+            try:
+                with zipfile.ZipFile(BytesIO(raw), 'r') as z:
+                    total += max(len(get_supported_zip_members(z)), 1)
+            except (zipfile.BadZipFile, OSError):
+                total += 1
     else:
         total = len(uploaded_files)
-    return total
+    return max(total, 1)
 
 
 def read_files(uploaded_files, mode, progress_bar, status_text):
@@ -95,55 +194,107 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
     all_dfs = []
     total = count_total_files(uploaded_files, mode)
     done = 0
+    loaded_files = 0
+    skipped_files = 0
 
     for uf in uploaded_files:
         if mode == 'zip':
-            with zipfile.ZipFile(BytesIO(uf.read()), 'r') as z:
-                excel_files = [
-                    f for f in z.namelist()
-                    if (f.lower().endswith('.xlsx') or f.lower().endswith('.xls') or f.lower().endswith('.csv'))
-                    and not f.startswith('__MACOSX')
-                    and not os.path.basename(f).startswith('~$')
-                ]
-                for ef in sorted(excel_files):
-                    base = os.path.basename(ef)
-                    status_text.text(f"📖 Membaca: {base}  ({done + 1}/{total})")
-                    try:
-                        with z.open(ef) as f:
-                            file_bytes = BytesIO(f.read())
-                        if ef.lower().endswith('.csv'):
-                            df_part = pd.read_csv(file_bytes)
+            raw_zip = uf.read()
+            uf.seek(0)
+            try:
+                with zipfile.ZipFile(BytesIO(raw_zip), 'r') as z:
+                    excel_files = sorted(get_supported_zip_members(z))
+
+                    if not excel_files:
+                        status_text.text(f"📦 Memeriksa: {uf.name}  ({done + 1}/{total})")
+                        st.warning(f"Skip `{uf.name}`: ZIP tidak berisi file Excel/CSV yang didukung.")
+                        done += 1
+                        skipped_files += 1
+                        advance_progress(progress_bar, done, total)
+                        continue
+
+                    for ef in excel_files:
+                        base = os.path.basename(ef)
+                        source_name = f"{uf.name} → {base}"
+                        status_text.text(f"📖 Membaca: {source_name}  ({done + 1}/{total})")
+                        try:
+                            with z.open(ef) as f:
+                                raw_bytes = f.read()
+                            df_part = load_dataframe_from_bytes(ef, raw_bytes)
+                        except Exception as exc:
+                            st.warning(f"Skip `{source_name}`: gagal membaca file ({exc}).")
+                            skipped_files += 1
                         else:
-                            df_part = pd.read_excel(file_bytes, engine='openpyxl', dtype=str)
-                        all_dfs.append(df_part)
-                    except Exception:
-                        st.warning(f"Gagal membaca: {base}")
-                    done += 1
-                    progress_bar.progress(done / total, text=f"{int(done / total * 100)}%")
+                            prepared_df, warning_message = validate_and_prepare_dataframe(df_part, source_name)
+                            if warning_message:
+                                st.warning(warning_message)
+                                skipped_files += 1
+                            else:
+                                all_dfs.append(prepared_df)
+                                loaded_files += 1
+                        done += 1
+                        advance_progress(progress_bar, done, total)
+            except (zipfile.BadZipFile, OSError) as exc:
+                status_text.text(f"📦 Memeriksa: {uf.name}  ({done + 1}/{total})")
+                st.warning(f"Skip `{uf.name}`: file ZIP tidak valid ({exc}).")
+                done += 1
+                skipped_files += 1
+                advance_progress(progress_bar, done, total)
 
         elif mode == 'excel':
             status_text.text(f"📖 Membaca: {uf.name}  ({done + 1}/{total})")
-            df_part = pd.read_excel(BytesIO(uf.read()), engine='openpyxl', dtype=str)
-            all_dfs.append(df_part)
+            try:
+                df_part = load_dataframe_from_bytes(uf.name, uf.read())
+            except Exception as exc:
+                st.warning(f"Skip `{uf.name}`: gagal membaca file ({exc}).")
+                skipped_files += 1
+            else:
+                prepared_df, warning_message = validate_and_prepare_dataframe(df_part, uf.name)
+                if warning_message:
+                    st.warning(warning_message)
+                    skipped_files += 1
+                else:
+                    all_dfs.append(prepared_df)
+                    loaded_files += 1
             done += 1
-            progress_bar.progress(done / total, text=f"{int(done / total * 100)}%")
+            advance_progress(progress_bar, done, total)
 
         elif mode == 'csv':
             status_text.text(f"📖 Membaca: {uf.name}  ({done + 1}/{total})")
-            df_part = pd.read_csv(uf)
-            all_dfs.append(df_part)
+            try:
+                df_part = load_dataframe_from_bytes(uf.name, uf.read())
+            except Exception as exc:
+                st.warning(f"Skip `{uf.name}`: gagal membaca file ({exc}).")
+                skipped_files += 1
+            else:
+                prepared_df, warning_message = validate_and_prepare_dataframe(df_part, uf.name)
+                if warning_message:
+                    st.warning(warning_message)
+                    skipped_files += 1
+                else:
+                    all_dfs.append(prepared_df)
+                    loaded_files += 1
             done += 1
-            progress_bar.progress(done / total, text=f"{int(done / total * 100)}%")
+            advance_progress(progress_bar, done, total)
 
-    status_text.text("✅ Semua file berhasil dibaca!")
+    if loaded_files:
+        status_text.text(
+            f"✅ Selesai: {loaded_files} file valid diproses, {skipped_files} file dilewati."
+        )
+    else:
+        status_text.text("⚠️ Tidak ada file valid yang bisa diproses.")
 
     if not all_dfs:
-        return None
-    return pd.concat(all_dfs, ignore_index=True, sort=False)
+        return None, {'loaded_files': loaded_files, 'skipped_files': skipped_files}
+    return (
+        pd.concat(all_dfs, ignore_index=True, sort=False),
+        {'loaded_files': loaded_files, 'skipped_files': skipped_files}
+    )
 
 
 def proses_data(df, exclude_batal=True):
     """Process data: filter, fix numbers, calculate."""
+    df = ensure_total_harga_produk(df)
 
     # Detect period
     periode = "Tidak Diketahui"
@@ -159,18 +310,13 @@ def proses_data(df, exclude_batal=True):
 
     # Filter cancelled orders
     if exclude_batal:
-        df_valid = df[~df[COL_STATUS].str.lower().str.contains('batal', na=False)].copy()
+        status_series = df[COL_STATUS].astype(str)
+        df_valid = df[~status_series.str.lower().str.contains('batal', na=False)].copy()
     else:
         df_valid = df.copy()
 
     # Fix Indonesian number format: dot=thousands, comma=decimal
-    df_valid[COL_HARGA] = (
-        df_valid[COL_HARGA]
-        .astype(str)
-        .str.replace('.', '', regex=False)
-        .str.replace(',', '.', regex=False)
-    )
-    df_valid[COL_HARGA] = pd.to_numeric(df_valid[COL_HARGA], errors='coerce').fillna(0)
+    df_valid[COL_HARGA] = parse_angka_indonesia(df_valid[COL_HARGA])
 
     total_omzet = df_valid[COL_HARGA].sum()
 
@@ -182,12 +328,15 @@ def proses_data(df, exclude_batal=True):
         .reset_index()
         .rename(columns={COL_HARGA: 'Total Omzet'})
     )
-    omzet_prov['Persen'] = (omzet_prov['Total Omzet'] / total_omzet * 100).round(1)
+    if total_omzet > 0:
+        omzet_prov['Persen'] = (omzet_prov['Total Omzet'] / total_omzet * 100).round(1)
+    else:
+        omzet_prov['Persen'] = 0.0
 
     return periode, total_omzet, df_valid, omzet_prov
 
 
-def buat_tabel(periode, total_omzet, omzet_prov):
+def buat_tabel(periode, total_omzet, omzet_prov, footer_text):
     """Generate Top 10 table as matplotlib figure."""
     top_10 = omzet_prov.head(10)
 
@@ -226,14 +375,26 @@ def buat_tabel(periode, total_omzet, omzet_prov):
         table[i, 1].set_text_props(ha='left')
         table[i, 1]._loc = 'left'
 
-    fig.text(0.5, 0.02, 'Data source: Shopee Order Export  ·  Status ≠ Batal',
-             fontsize=8, color='#666666', ha='center', style='italic')
+    fig.text(0.5, 0.02, footer_text, fontsize=8, color='#666666', ha='center', style='italic')
 
     plt.tight_layout()
     return fig
 
 
-def buat_pie_chart(periode, total_omzet, omzet_prov):
+def can_render_pie_chart(total_omzet, omzet_prov):
+    if total_omzet <= 0 or omzet_prov.empty:
+        return False
+    return omzet_prov['Total Omzet'].fillna(0).gt(0).any()
+
+
+def get_pie_colors(count):
+    if count <= len(PIE_COLORS):
+        return PIE_COLORS[:count]
+    repeat = (count // len(PIE_COLORS)) + 1
+    return (PIE_COLORS * repeat)[:count]
+
+
+def buat_pie_chart(periode, total_omzet, omzet_prov, footer_text):
     """Generate Pie chart as matplotlib figure."""
     pie_data = omzet_prov.copy()
     threshold = 1.5
@@ -251,9 +412,9 @@ def buat_pie_chart(periode, total_omzet, omzet_prov):
     fig, ax = plt.subplots(figsize=(8, 6), facecolor='white')
     ax.set_facecolor('white')
 
-    colors = PIE_COLORS[:len(pie_main)]
+    colors = get_pie_colors(len(pie_main))
 
-    wedges, texts, autotexts = ax.pie(
+    wedges, _, _ = ax.pie(
         pie_main['Total Omzet'], labels=None,
         autopct=lambda pct: f'{pct:.1f}%' if pct >= 3 else '',
         colors=colors, startangle=90, counterclock=False, pctdistance=0.78,
@@ -275,8 +436,7 @@ def buat_pie_chart(periode, total_omzet, omzet_prov):
         labelcolor='black', handlelength=1.0, handleheight=0.9, labelspacing=0.6
     )
 
-    fig.text(0.5, 0.03, 'Data source: Shopee Order Export  ·  Status ≠ Batal',
-             fontsize=7, color='#888888', ha='center', style='italic')
+    fig.text(0.5, 0.03, footer_text, fontsize=7, color='#888888', ha='center', style='italic')
 
     fig.subplots_adjust(left=0.05, right=0.58, top=0.86, bottom=0.08)
 
@@ -337,17 +497,25 @@ if uploaded_files:
     st.markdown("### 📂 Membaca Data...")
     progress_bar = st.progress(0, text="0%")
     status_text = st.empty()
-    df = read_files(uploaded_files, mode, progress_bar, status_text)
+    df, file_stats = read_files(uploaded_files, mode, progress_bar, status_text)
 
     if df is None or len(df) == 0:
-        st.error("Tidak ada data yang berhasil dibaca.")
+        st.error("Tidak ada file valid yang bisa dianalisis. Periksa warning di atas lalu coba lagi.")
         st.stop()
 
     st.success(f"✅ Data berhasil dimuat: **{len(df):,}** baris, **{len(df.columns)}** kolom")
+    if file_stats['skipped_files'] > 0:
+        st.warning(
+            f"Sebagian file dilewati: **{file_stats['loaded_files']}** valid, "
+            f"**{file_stats['skipped_files']}** di-skip."
+        )
 
     # --- Process Data ---
     with st.spinner("Menganalisis data..."):
         periode, total_omzet, df_valid, omzet_prov = proses_data(df, exclude_batal)
+
+    footer_text = get_chart_footer(exclude_batal)
+    pie_chart_available = can_render_pie_chart(total_omzet, omzet_prov)
 
     # --- Summary Metrics ---
     st.markdown("### 📋 Ringkasan")
@@ -364,7 +532,7 @@ if uploaded_files:
     tab1, tab2, tab3 = st.tabs(["📊 Tabel Top 10", "🥧 Pie Chart", "📥 Download"])
 
     with tab1:
-        fig_tabel = buat_tabel(periode, total_omzet, omzet_prov)
+        fig_tabel = buat_tabel(periode, total_omzet, omzet_prov, footer_text)
         st.pyplot(fig_tabel)
         plt.close(fig_tabel)
 
@@ -372,20 +540,25 @@ if uploaded_files:
             st.dataframe(df_valid.head(100), use_container_width=True)
 
     with tab2:
-        fig_pie = buat_pie_chart(periode, total_omzet, omzet_prov)
-        st.pyplot(fig_pie)
-        plt.close(fig_pie)
+        if pie_chart_available:
+            fig_pie = buat_pie_chart(periode, total_omzet, omzet_prov, footer_text)
+            st.pyplot(fig_pie)
+            plt.close(fig_pie)
+        else:
+            st.info("Tidak ada data omzet valid untuk divisualisasikan dalam pie chart.")
 
     with tab3:
         st.markdown("### 📥 Download Hasil")
 
         # Generate PNGs only when needed for download
-        fig_t = buat_tabel(periode, total_omzet, omzet_prov)
-        fig_p = buat_pie_chart(periode, total_omzet, omzet_prov)
+        fig_t = buat_tabel(periode, total_omzet, omzet_prov, footer_text)
         tabel_bytes = fig_to_bytes(fig_t)
-        pie_bytes = fig_to_bytes(fig_p)
         plt.close(fig_t)
-        plt.close(fig_p)
+        pie_bytes = None
+        if pie_chart_available:
+            fig_p = buat_pie_chart(periode, total_omzet, omzet_prov, footer_text)
+            pie_bytes = fig_to_bytes(fig_p)
+            plt.close(fig_p)
 
         # CSV merged
         csv_buf = BytesIO()
@@ -403,12 +576,15 @@ if uploaded_files:
                 mime="image/png"
             )
         with c2:
-            st.download_button(
-                "🥧 Download Pie Chart PNG",
-                data=pie_bytes,
-                file_name=f"PieChart_{periode_safe}.png",
-                mime="image/png"
-            )
+            if pie_chart_available and pie_bytes is not None:
+                st.download_button(
+                    "🥧 Download Pie Chart PNG",
+                    data=pie_bytes,
+                    file_name=f"PieChart_{periode_safe}.png",
+                    mime="image/png"
+                )
+            else:
+                st.info("Pie chart tidak tersedia karena total omzet tidak punya nilai positif.")
         with c3:
             st.download_button(
                 "⚡ Download Merged CSV",

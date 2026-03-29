@@ -2,5 +2,3 @@ streamlit>=1.45.0
 pandas
 openpyxl
 matplotlib
-numpy
-altair>=5
