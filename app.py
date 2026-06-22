@@ -31,10 +31,24 @@ st.markdown("""
 COL_STATUS   = 'Status Pesanan'
 COL_HARGA    = 'Total Harga Produk'
 COL_PROVINSI = 'Provinsi'
+COL_KOTA     = 'Kota/Kabupaten'
 COL_TANGGAL  = 'Waktu Pesanan Dibuat'
 COL_HARGA_DISKON = 'Harga Setelah Diskon'
 COL_JUMLAH = 'Jumlah'
-COLS_NEEDED  = [COL_STATUS, COL_PROVINSI]
+
+# Status selalu wajib; kolom dimensi (Provinsi/Kota) divalidasi terpisah
+# sesuai pilihan user agar opsi By Provinsi tetap backward compatible.
+COLS_NEEDED  = [COL_STATUS]
+
+# Dimensi grouping yang tersedia di UI. 'provinsi' adalah default.
+DIMENSIONS = {
+    'provinsi': {'col': COL_PROVINSI, 'label': 'Provinsi'},
+    'kota':     {'col': COL_KOTA,     'label': 'Kota/Kabupaten'},
+}
+DEFAULT_DIMENSION = 'provinsi'
+
+# Placeholder untuk nilai dimensi yang kosong/NaN agar tidak hilang saat groupby.
+NILAI_KOSONG = 'Tidak Diketahui'
 
 BULAN_INDO = {
     1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'Mei', 6: 'Jun',
@@ -89,9 +103,14 @@ def get_chart_footer(exclude_batal):
     return f'Data source: Shopee Order Export  ·  {status_label}'
 
 
-def validate_required_columns(df):
-    """Validate whether a dataframe has the minimum columns needed for analysis."""
-    missing_cols = [col for col in COLS_NEEDED if col not in df.columns]
+def validate_required_columns(df, dim_col):
+    """Validate whether a dataframe has the minimum columns needed for analysis.
+
+    `dim_col` is the grouping column selected by the user (Provinsi or
+    Kota/Kabupaten); it is required in addition to the always-needed columns.
+    """
+    required_cols = COLS_NEEDED + [dim_col]
+    missing_cols = [col for col in required_cols if col not in df.columns]
     has_total_harga = COL_HARGA in df.columns
     has_fallback_harga = COL_HARGA_DISKON in df.columns and COL_JUMLAH in df.columns
 
@@ -158,8 +177,8 @@ def load_dataframe_from_bytes(file_name, raw_bytes):
     return pd.read_excel(file_bytes, engine='openpyxl', dtype=str)
 
 
-def validate_and_prepare_dataframe(df, source_name):
-    missing_parts = validate_required_columns(df)
+def validate_and_prepare_dataframe(df, source_name, dim_col):
+    missing_parts = validate_required_columns(df, dim_col)
     if missing_parts:
         missing_text = '; '.join(missing_parts)
         return None, f"Skip `{source_name}`: kolom wajib tidak lengkap ({missing_text})."
@@ -189,7 +208,7 @@ def count_total_files(uploaded_files, mode):
     return max(total, 1)
 
 
-def read_files(uploaded_files, mode, progress_bar, status_text):
+def read_files(uploaded_files, mode, progress_bar, status_text, dim_col):
     """Read uploaded files into a list of DataFrames with progress."""
     all_dfs = []
     total = count_total_files(uploaded_files, mode)
@@ -225,7 +244,7 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
                             st.warning(f"Skip `{source_name}`: gagal membaca file ({exc}).")
                             skipped_files += 1
                         else:
-                            prepared_df, warning_message = validate_and_prepare_dataframe(df_part, source_name)
+                            prepared_df, warning_message = validate_and_prepare_dataframe(df_part, source_name, dim_col)
                             if warning_message:
                                 st.warning(warning_message)
                                 skipped_files += 1
@@ -249,7 +268,7 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
                 st.warning(f"Skip `{uf.name}`: gagal membaca file ({exc}).")
                 skipped_files += 1
             else:
-                prepared_df, warning_message = validate_and_prepare_dataframe(df_part, uf.name)
+                prepared_df, warning_message = validate_and_prepare_dataframe(df_part, uf.name, dim_col)
                 if warning_message:
                     st.warning(warning_message)
                     skipped_files += 1
@@ -267,7 +286,7 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
                 st.warning(f"Skip `{uf.name}`: gagal membaca file ({exc}).")
                 skipped_files += 1
             else:
-                prepared_df, warning_message = validate_and_prepare_dataframe(df_part, uf.name)
+                prepared_df, warning_message = validate_and_prepare_dataframe(df_part, uf.name, dim_col)
                 if warning_message:
                     st.warning(warning_message)
                     skipped_files += 1
@@ -292,8 +311,11 @@ def read_files(uploaded_files, mode, progress_bar, status_text):
     )
 
 
-def proses_data(df, exclude_batal=True):
-    """Process data: filter, fix numbers, calculate."""
+def proses_data(df, exclude_batal=True, dim_col=COL_PROVINSI):
+    """Process data: filter, fix numbers, calculate.
+
+    `dim_col` selects the grouping dimension (Provinsi or Kota/Kabupaten).
+    """
     df = ensure_total_harga_produk(df)
 
     # Detect period
@@ -318,11 +340,21 @@ def proses_data(df, exclude_batal=True):
     # Fix Indonesian number format: dot=thousands, comma=decimal
     df_valid[COL_HARGA] = parse_angka_indonesia(df_valid[COL_HARGA])
 
+    # Normalize the grouping dimension: blank/NaN values are bucketed into
+    # NILAI_KOSONG so their omzet still appears (groupby would otherwise drop
+    # NaN, making the slices sum to less than total omzet).
+    dim_values = df_valid[dim_col].fillna('').astype(str).str.strip()
+    dim_values = dim_values.mask(
+        dim_values.str.lower().isin(['', 'nan', 'none', 'nat']),
+        NILAI_KOSONG,
+    )
+    df_valid[dim_col] = dim_values
+
     total_omzet = df_valid[COL_HARGA].sum()
 
     omzet_prov = (
         df_valid
-        .groupby(COL_PROVINSI)[COL_HARGA]
+        .groupby(dim_col)[COL_HARGA]
         .sum()
         .sort_values(ascending=False)
         .reset_index()
@@ -336,7 +368,7 @@ def proses_data(df, exclude_batal=True):
     return periode, total_omzet, df_valid, omzet_prov
 
 
-def buat_tabel(periode, total_omzet, omzet_prov, footer_text):
+def buat_tabel(periode, total_omzet, omzet_prov, footer_text, dim_col=COL_PROVINSI, dim_label='Provinsi'):
     """Generate Top 10 table as matplotlib figure."""
     top_10 = omzet_prov.head(10)
 
@@ -345,14 +377,14 @@ def buat_tabel(periode, total_omzet, omzet_prov, footer_text):
     ax.set_facecolor('white')
 
     ax.set_title(
-        f'TOP 10 PROVINSI BY OMZET\nPeriode: {periode}  ·  Total Omzet: Rp {format_rupiah(total_omzet)}',
+        f'TOP 10 {dim_label.upper()} BY OMZET\nPeriode: {periode}  ·  Total Omzet: Rp {format_rupiah(total_omzet)}',
         fontsize=11, fontweight='bold', color='black', pad=14, linespacing=1.5
     )
 
-    col_labels = ['No', 'Provinsi', 'Total Omzet (Rp)', 'Persentase']
+    col_labels = ['No', dim_label, 'Total Omzet (Rp)', 'Persentase']
     table_data = []
     for i, (_, row) in enumerate(top_10.iterrows(), 1):
-        table_data.append([str(i), row[COL_PROVINSI], format_rupiah(row['Total Omzet']), f"{row['Persen']}%"])
+        table_data.append([str(i), row[dim_col], format_rupiah(row['Total Omzet']), f"{row['Persen']}%"])
 
     table = ax.table(cellText=table_data, colLabels=col_labels, loc='center',
                      cellLoc='center', colWidths=[0.08, 0.35, 0.32, 0.15])
@@ -394,17 +426,21 @@ def get_pie_colors(count):
     return (PIE_COLORS * repeat)[:count]
 
 
-def buat_pie_chart(periode, total_omzet, omzet_prov, footer_text):
+def buat_pie_chart(periode, total_omzet, omzet_prov, footer_text, dim_col=COL_PROVINSI, dim_label='Provinsi'):
     """Generate Pie chart as matplotlib figure."""
     pie_data = omzet_prov.copy()
     threshold = 1.5
     small_mask = pie_data['Persen'] < threshold
     if small_mask.any():
         lainnya_total = pie_data.loc[small_mask, 'Total Omzet'].sum()
-        lainnya_persen = round(pie_data.loc[small_mask, 'Persen'].sum(), 1)
+        # Compute from the omzet ratio directly, not by summing already-rounded
+        # per-item Persen — with many tiny slices (e.g. ratusan kota) those
+        # round down to 0.0 and undercount, making the legend disagree with the
+        # wedge's autopct label.
+        lainnya_persen = round(lainnya_total / total_omzet * 100, 1) if total_omzet else 0.0
         pie_main = pie_data[~small_mask].copy()
         pie_main = pd.concat([pie_main, pd.DataFrame([{
-            COL_PROVINSI: 'Lainnya', 'Total Omzet': lainnya_total, 'Persen': lainnya_persen
+            dim_col: 'Lainnya', 'Total Omzet': lainnya_total, 'Persen': lainnya_persen
         }])], ignore_index=True)
     else:
         pie_main = pie_data.copy()
@@ -423,13 +459,13 @@ def buat_pie_chart(periode, total_omzet, omzet_prov, footer_text):
     )
 
     fig.suptitle(
-        f'Distribusi Omzet per Provinsi\nPeriode: {periode}  ·  Total Omzet: Rp {format_rupiah(total_omzet)}',
+        f'Distribusi Omzet per {dim_label}\nPeriode: {periode}  ·  Total Omzet: Rp {format_rupiah(total_omzet)}',
         fontsize=12, fontweight='bold', color='black', y=0.96, linespacing=1.5
     )
 
     ax.legend(
         wedges,
-        [f'{row[COL_PROVINSI]}  ({row["Persen"]}%)' for _, row in pie_main.iterrows()],
+        [f'{row[dim_col]}  ({row["Persen"]}%)' for _, row in pie_main.iterrows()],
         loc='center left', bbox_to_anchor=(1.05, 0.5),
         fontsize=8.5, frameon=True, fancybox=True,
         facecolor='white', edgecolor='#CCCCCC',
@@ -456,7 +492,7 @@ def fig_to_bytes(fig):
 # =============================================================
 
 st.title("📊 BAM Insight")
-st.subheader("Top Omzet By Demographic — Analisis per Provinsi")
+st.subheader("Top Omzet By Demographic — Analisis per Provinsi / Kota-Kabupaten")
 st.markdown("---")
 
 # --- Upload Section ---
@@ -487,6 +523,18 @@ uploaded_files = st.sidebar.file_uploader(
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Filter")
+
+dimension_keys = list(DIMENSIONS.keys())
+dimension_key = st.sidebar.radio(
+    "Tampilkan berdasarkan:",
+    options=dimension_keys,
+    format_func=lambda k: DIMENSIONS[k]['label'],
+    index=dimension_keys.index(DEFAULT_DIMENSION),
+    help="Pilih dimensi agregasi omzet. Default: Provinsi.",
+)
+dim_col = DIMENSIONS[dimension_key]['col']
+dim_label = DIMENSIONS[dimension_key]['label']
+
 exclude_batal = st.sidebar.toggle(
     "Exclude Pesanan Batal",
     value=True,
@@ -497,10 +545,13 @@ if uploaded_files:
     st.markdown("### 📂 Membaca Data...")
     progress_bar = st.progress(0, text="0%")
     status_text = st.empty()
-    df, file_stats = read_files(uploaded_files, mode, progress_bar, status_text)
+    df, file_stats = read_files(uploaded_files, mode, progress_bar, status_text, dim_col)
 
     if df is None or len(df) == 0:
-        st.error("Tidak ada file valid yang bisa dianalisis. Periksa warning di atas lalu coba lagi.")
+        st.error(
+            f"Tidak ada file valid yang bisa dianalisis untuk dimensi **{dim_label}**. "
+            f"Pastikan file punya kolom `{dim_col}`, lalu periksa warning di atas dan coba lagi."
+        )
         st.stop()
 
     st.success(f"✅ Data berhasil dimuat: **{len(df):,}** baris, **{len(df.columns)}** kolom")
@@ -512,7 +563,7 @@ if uploaded_files:
 
     # --- Process Data ---
     with st.spinner("Menganalisis data..."):
-        periode, total_omzet, df_valid, omzet_prov = proses_data(df, exclude_batal)
+        periode, total_omzet, df_valid, omzet_prov = proses_data(df, exclude_batal, dim_col)
 
     footer_text = get_chart_footer(exclude_batal)
     pie_chart_available = can_render_pie_chart(total_omzet, omzet_prov)
@@ -523,7 +574,7 @@ if uploaded_files:
     col1.metric("Periode", periode)
     col2.metric("Total Omzet", format_rupiah_singkat(total_omzet))
     col3.metric("Pesanan Valid", f"{len(df_valid):,}")
-    col4.metric("Jumlah Provinsi", df_valid[COL_PROVINSI].nunique())
+    col4.metric(f"Jumlah {dim_label}", df_valid[dim_col].nunique())
 
     st.markdown("---")
 
@@ -532,7 +583,7 @@ if uploaded_files:
     tab1, tab2, tab3 = st.tabs(["📊 Tabel Top 10", "🥧 Pie Chart", "📥 Download"])
 
     with tab1:
-        fig_tabel = buat_tabel(periode, total_omzet, omzet_prov, footer_text)
+        fig_tabel = buat_tabel(periode, total_omzet, omzet_prov, footer_text, dim_col, dim_label)
         st.pyplot(fig_tabel)
         plt.close(fig_tabel)
 
@@ -541,7 +592,7 @@ if uploaded_files:
 
     with tab2:
         if pie_chart_available:
-            fig_pie = buat_pie_chart(periode, total_omzet, omzet_prov, footer_text)
+            fig_pie = buat_pie_chart(periode, total_omzet, omzet_prov, footer_text, dim_col, dim_label)
             st.pyplot(fig_pie)
             plt.close(fig_pie)
         else:
@@ -551,12 +602,12 @@ if uploaded_files:
         st.markdown("### 📥 Download Hasil")
 
         # Generate PNGs only when needed for download
-        fig_t = buat_tabel(periode, total_omzet, omzet_prov, footer_text)
+        fig_t = buat_tabel(periode, total_omzet, omzet_prov, footer_text, dim_col, dim_label)
         tabel_bytes = fig_to_bytes(fig_t)
         plt.close(fig_t)
         pie_bytes = None
         if pie_chart_available:
-            fig_p = buat_pie_chart(periode, total_omzet, omzet_prov, footer_text)
+            fig_p = buat_pie_chart(periode, total_omzet, omzet_prov, footer_text, dim_col, dim_label)
             pie_bytes = fig_to_bytes(fig_p)
             plt.close(fig_p)
 
@@ -566,13 +617,14 @@ if uploaded_files:
         csv_bytes = csv_buf.getvalue()
 
         periode_safe = periode.replace(' ', '_').replace('-', 'to')
+        dim_safe = dim_label.replace('/', '-').replace(' ', '_')
 
         c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
                 "📊 Download Tabel PNG",
                 data=tabel_bytes,
-                file_name=f"Tabel_Top10_{periode_safe}.png",
+                file_name=f"Tabel_Top10_{dim_safe}_{periode_safe}.png",
                 mime="image/png"
             )
         with c2:
@@ -580,7 +632,7 @@ if uploaded_files:
                 st.download_button(
                     "🥧 Download Pie Chart PNG",
                     data=pie_bytes,
-                    file_name=f"PieChart_{periode_safe}.png",
+                    file_name=f"PieChart_{dim_safe}_{periode_safe}.png",
                     mime="image/png"
                 )
             else:
